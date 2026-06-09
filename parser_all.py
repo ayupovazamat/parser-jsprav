@@ -6,9 +6,10 @@ import re
 import time
 import requests
 import sys
+import os
+import argparse
 from urllib.parse import urljoin, urlparse
 from bs4 import BeautifulSoup
-import os
 
 HEADERS = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
 TIMEOUT = 10
@@ -34,6 +35,15 @@ PHONE_PATTERN = re.compile(r'(\+7|8)?[\s\-]*\(?(\d{3})\)?[\s\-]*(\d{3})[\s\-]*(\
 TG_PATTERNS = [r'(?:https?://)?(?:t\.me|telegram\.me)/([a-zA-Z0-9_]+)']
 WA_PATTERNS = [r'(?:https?://)?(?:wa\.me|api\.whatsapp\.com)/[^\s"\'>]+']
 VK_PATTERNS = [r'(?:https?://)?(?:vk\.com|vkontakte\.ru)/([a-zA-Z0-9_.]+)']
+
+def parse_arguments():
+    parser = argparse.ArgumentParser(description='Сбор контактов с сайтов компаний')
+    parser.add_argument('input_csv', help='Входной CSV файл с колонкой site')
+    parser.add_argument('output_csv', help='Выходной CSV файл')
+    parser.add_argument('site_column', nargs='?', default='site', help='Название колонки с URL сайта')
+    parser.add_argument('--test', action='store_true', help='Тестовый режим (только 1 контакт на сайт)')
+    parser.add_argument('--delay', type=int, default=1, help='Задержка между сайтами (сек)')
+    return parser.parse_args()
 
 def clean_phone(phone_str):
     digits = re.sub(r'\D', '', phone_str)
@@ -125,10 +135,6 @@ def find_contact_links_from_main(html, base_domain):
                 paths.add(path)
     return list(paths)
 
-def is_contact_path(path):
-    keywords = ['contact', 'kontakt', 'обратн', 'связ', 'feedback', 'support', 'map', 'adres', 'реквизит', 'requisite', 'about', 'о нас', 'help']
-    return any(kw in path.lower() for kw in keywords)
-
 def has_any_social(contacts):
     return bool(contacts['telegram'] or contacts['whatsapp'] or contacts['vk'])
 
@@ -141,7 +147,7 @@ def format_contacts(contacts):
         'vk': contacts['vk']
     }
 
-def find_contacts_on_site(base_url):
+def find_contacts_on_site(base_url, test_mode=False):
     contacts = {
         'emails': set(),
         'phones': set(),
@@ -150,7 +156,6 @@ def find_contacts_on_site(base_url):
         'vk': ''
     }
     
-    # ----- Шаг 1: главная -----
     print(f"    Запрашиваем: {base_url}")
     html, status, final_url = get_page_follow_redirects(base_url)
     if status != 200:
@@ -169,19 +174,19 @@ def find_contacts_on_site(base_url):
         if not contacts[k] and soc[k]:
             contacts[k] = soc[k]
 
-    # ----- Шаг 2: динамические ссылки на контакты (из главной) -----
+    if test_mode and (contacts['emails'] or contacts['phones']):
+        print("    Тестовый режим: контакт найден на главной")
+        return format_contacts(contacts)
+
     dynamic_paths = find_contact_links_from_main(html, base_domain)
-    # Ограничимся 7 ссылками
     dynamic_paths = dynamic_paths[:7]
-    
-    # Запоминаем, какие пути мы уже проверили
     checked_paths = set()
 
     for path in dynamic_paths:
         url = urljoin(base_domain, path)
         print(f"    Проверяем динамическую страницу: {url}")
         html2, status2, _ = get_page_follow_redirects(url)
-        checked_paths.add(path)  # запоминаем проверенный путь
+        checked_paths.add(path)
         if status2 != 200 or not html2:
             continue
         soup2 = BeautifulSoup(html2, 'lxml')
@@ -194,14 +199,15 @@ def find_contacts_on_site(base_url):
                 contacts[k] = soc2[k]
 
         time.sleep(DELAY_BETWEEN_PAGES)
+        
+        if test_mode and (contacts['emails'] or contacts['phones']):
+            print("    Тестовый режим: контакт найден на динамической странице")
+            return format_contacts(contacts)
 
-    # ----- Шаг 3: статический список (только те пути, которые не проверяли) -----
     short_static = [
         '/contacts', '/contact', '/kontakty', '/about', '/o-nas',
         '/contact-us', '/feedback', '/obratnaya-svyaz'
     ]
-    
-    # Фильтруем: проверяем только те пути, которые ещё не были проверены
     remaining_paths = [path for path in short_static if path not in checked_paths]
     
     if remaining_paths:
@@ -223,6 +229,10 @@ def find_contacts_on_site(base_url):
                 contacts[k] = soc2[k]
 
         time.sleep(DELAY_BETWEEN_PAGES)
+        
+        if test_mode and (contacts['emails'] or contacts['phones']):
+            print("    Тестовый режим: контакт найден на статической странице")
+            return format_contacts(contacts)
 
     return format_contacts(contacts)
 
@@ -238,26 +248,34 @@ def load_existing(output_csv):
         pass
     return existing
 
-def process_sites_from_csv(input_csv, output_csv, site_column='site'):
-    # Создаём директорию для выходного файла, если нужно
+def process_sites_from_csv(input_csv, output_csv, site_column='site', test_mode=False, delay=1):
     output_dir = os.path.dirname(output_csv)
     if output_dir and not os.path.exists(output_dir):
         os.makedirs(output_dir, exist_ok=True)
-        
+    
+    if test_mode:
+        print(f"\n⚠️ ТЕСТОВЫЙ РЕЖИМ: только по 1 контакту на сайт ⚠️\n")
+    
     existing = load_existing(output_csv)
     new_rows = []
+    
     with open(input_csv, 'r', encoding='utf-8-sig') as f:
         for row in csv.DictReader(f):
             site = row.get(site_column, '').strip()
+            source_url = row.get('source_url', '')
+            
             if not site or site in existing:
                 if site:
                     print(f"Пропускаем (уже есть): {site}")
                 continue
+            
             print(f"Обработка: {site}")
-            contacts = find_contacts_on_site(site)
+            contacts = find_contacts_on_site(site, test_mode)
+            
             new_row = {
                 'name': row.get('name', ''),
                 'site': site,
+                'source_url': source_url,
                 'emails': contacts['emails'],
                 'phones': contacts['phones'],
                 'telegram': contacts['telegram'],
@@ -266,18 +284,24 @@ def process_sites_from_csv(input_csv, output_csv, site_column='site'):
             }
             new_rows.append(new_row)
             existing[site] = new_row
-            time.sleep(DELAY_BETWEEN_SITES)
-    # Объединяем старые и новые
+            time.sleep(delay)
+    
     all_rows = list(existing.values())
-    fieldnames = ['name', 'site', 'emails', 'phones', 'telegram', 'whatsapp', 'vk']
+    fieldnames = ['name', 'site', 'source_url', 'emails', 'phones', 'telegram', 'whatsapp', 'vk']
+    
     with open(output_csv, 'w', newline='', encoding='utf-8-sig') as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(all_rows)
+    
     print(f"Готово. Обработано новых сайтов: {len(new_rows)}. Результат в {output_csv}")
 
 if __name__ == '__main__':
-    if len(sys.argv) < 3:
-        print("Использование: python parser_all.py input.csv output.csv [site_column]")
-        sys.exit(1)
-    process_sites_from_csv(sys.argv[1], sys.argv[2], sys.argv[3] if len(sys.argv) > 3 else 'site')
+    args = parse_arguments()
+    process_sites_from_csv(
+        args.input_csv, 
+        args.output_csv, 
+        args.site_column, 
+        args.test,
+        args.delay
+    )

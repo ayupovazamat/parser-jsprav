@@ -7,7 +7,9 @@ import base64
 import requests
 import sys
 import os
-from urllib.parse import urljoin
+import argparse
+import re
+from urllib.parse import urljoin, urlparse
 from bs4 import BeautifulSoup
 
 HEADERS = {
@@ -15,24 +17,18 @@ HEADERS = {
 }
 DELAY = 30
 
-# Обработка параметров командной строки
-if len(sys.argv) < 2:
-    print("Использование: python parser.py <файл_со_ссылками.txt> [выходной_файл.csv]")
-    print("Пример: python parser.py categories.txt output/jsprav.ru.csv")
-    sys.exit(1)
+def is_valid_url(url):
+    """Проверяет, является ли строка корректным URL"""
+    pattern = re.compile(r'^https?://[^\s/$.?#].[^\s]*$', re.IGNORECASE)
+    return pattern.match(url) is not None
 
-INPUT_FILE = sys.argv[1]
-
-# Если передан второй аргумент, используем его как имя выходного файла
-if len(sys.argv) > 2:
-    OUTPUT_CSV = sys.argv[2]
-else:
-    OUTPUT_CSV = 'jsprav.ru.csv'
-
-# Создаём директорию для выходного файла, если нужно
-output_dir = os.path.dirname(OUTPUT_CSV)
-if output_dir and not os.path.exists(output_dir):
-    os.makedirs(output_dir, exist_ok=True)
+def parse_arguments():
+    parser = argparse.ArgumentParser(description='Парсер компаний с jsprav.ru')
+    parser.add_argument('input_file', help='Файл со ссылками на категории')
+    parser.add_argument('output_file', nargs='?', default='jsprav.ru.csv', help='Выходной CSV файл')
+    parser.add_argument('--test', action='store_true', help='Тестовый режим (только по 1 компании с категории)')
+    parser.add_argument('--delay', type=int, default=30, help='Задержка между страницами (сек)')
+    return parser.parse_args()
 
 def decode_base64(data):
     try:
@@ -56,7 +52,7 @@ def get_page(url):
         print(f"Ошибка загрузки {url}: {e}")
         return None
 
-def parse_page(html):
+def parse_page(html, source_url):
     soup = BeautifulSoup(html, 'lxml')
     blocks = soup.select('div.company-info-c')
     if not blocks:
@@ -82,14 +78,21 @@ def parse_page(html):
                 if href and href.startswith('http'):
                     site = href
         if name:
-            companies.append({'name': name, 'site': site})
+            companies.append({
+                'name': name, 
+                'site': site,
+                'source_url': source_url
+            })
         elif site:
-            companies.append({'name': '', 'site': site})
+            companies.append({
+                'name': '', 
+                'site': site,
+                'source_url': source_url
+            })
     return companies
 
 def get_next_page_url(current_url, current_page):
     if '/page-' in current_url:
-        import re
         new_url = re.sub(r'/page-\d+/', f'/page-{current_page+1}/', current_url)
         return new_url
     else:
@@ -109,9 +112,14 @@ def save_to_csv(companies, filename, seen_sites=None):
                         seen_sites.add(row['site'])
         except FileNotFoundError:
             pass
+    
+    output_dir = os.path.dirname(filename)
+    if output_dir and not os.path.exists(output_dir):
+        os.makedirs(output_dir, exist_ok=True)
+    
     mode = 'a' if os.path.exists(filename) and seen_sites else 'w'
     with open(filename, mode, newline='', encoding='utf-8-sig') as f:
-        writer = csv.DictWriter(f, fieldnames=['name', 'site'])
+        writer = csv.DictWriter(f, fieldnames=['name', 'site', 'source_url'])
         if mode == 'w':
             writer.writeheader()
         added = 0
@@ -125,7 +133,7 @@ def save_to_csv(companies, filename, seen_sites=None):
         print(f"Добавлено {added} новых записей в {filename}")
     return seen_sites
 
-def process_category_url(start_url, seen_sites):
+def process_category_url(start_url, seen_sites, test_mode=False, delay=30):
     all_companies = []
     url = start_url
     page_num = 1
@@ -134,31 +142,39 @@ def process_category_url(start_url, seen_sites):
         html = get_page(url)
         if not html:
             break
-        companies = parse_page(html)
+        companies = parse_page(html, start_url)
         if not companies:
             print(f"На странице {page_num} нет компаний. Конец каталога.")
             break
         print(f"Найдено компаний на странице: {len(companies)}")
-        all_companies.extend(companies)
+        
+        if test_mode:
+            companies = companies[:1]
+            print(f"Тестовый режим: взята 1 компания")
+            all_companies.extend(companies)
+            break
+        else:
+            all_companies.extend(companies)
+        
         next_url = get_next_page_url(url, page_num)
         if next_url == url:
             break
         url = next_url
         page_num += 1
-        print(f"Ожидание {DELAY} секунд...")
-        time.sleep(DELAY)
+        print(f"Ожидание {delay} секунд...")
+        time.sleep(delay)
     return all_companies
 
 def main():
-    # Проверяем, что входной файл существует
-    if not os.path.exists(INPUT_FILE):
-        print(f"Ошибка: Файл {INPUT_FILE} не найден!")
+    args = parse_arguments()
+    
+    if not os.path.exists(args.input_file):
+        print(f"Ошибка: Файл {args.input_file} не найден!")
         sys.exit(1)
     
-    # Загружаем уже обработанные сайты
     seen_sites = set()
     try:
-        with open(OUTPUT_CSV, 'r', encoding='utf-8-sig') as f:
+        with open(args.output_file, 'r', encoding='utf-8-sig') as f:
             reader = csv.DictReader(f)
             for row in reader:
                 if row.get('site'):
@@ -166,34 +182,43 @@ def main():
     except FileNotFoundError:
         pass
     
-    # Читаем URL категорий из файла
-    with open(INPUT_FILE, 'r') as f:
-        urls = [line.strip() for line in f if line.strip()]
+    # Читаем URL категорий из файла, фильтруя только валидные URL
+    urls = []
+    with open(args.input_file, 'r') as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            if is_valid_url(line):
+                urls.append(line)
+            else:
+                print(f"Предупреждение: пропущена некорректная строка: {line}")
     
     if not urls:
-        print("Ошибка: Файл не содержит URL!")
+        print("Ошибка: Файл не содержит корректных URL!")
         sys.exit(1)
     
-    print(f"Найдено {len(urls)} URL категорий для обработки:")
+    print(f"Найдено {len(urls)} корректных URL категорий для обработки:")
     for u in urls:
         print(f"  - {u}")
     
-    # Обрабатываем каждую категорию
+    if args.test:
+        print(f"\n⚠️ ТЕСТОВЫЙ РЕЖИМ: по 1 компании с категории ⚠️\n")
+    
     for url in urls:
         print(f"\n=== Обработка категории: {url} ===")
-        companies = process_category_url(url, seen_sites)
+        companies = process_category_url(url, seen_sites, args.test, args.delay)
         if companies:
-            seen_sites = save_to_csv(companies, OUTPUT_CSV, seen_sites)
+            seen_sites = save_to_csv(companies, args.output_file, seen_sites)
         else:
             print(f"В категории {url} не найдено компаний")
     
-    # Финальная статистика
     try:
-        with open(OUTPUT_CSV, 'r', encoding='utf-8-sig') as f:
+        with open(args.output_file, 'r', encoding='utf-8-sig') as f:
             total = sum(1 for _ in f) - 1
-        print(f"\nГотово. Всего собрано компаний: {total}. Результат в {OUTPUT_CSV}")
+        print(f"\nГотово. Всего собрано компаний: {total}. Результат в {args.output_file}")
     except:
-        print(f"\nГотово. Результат в {OUTPUT_CSV}")
+        print(f"\nГотово. Результат в {args.output_file}")
 
 if __name__ == "__main__":
     main()
