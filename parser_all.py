@@ -5,20 +5,17 @@ import csv
 import re
 import time
 import requests
+import sys
 from urllib.parse import urljoin, urlparse
 from bs4 import BeautifulSoup
+import os
 
-# ------------------ НАСТРОЙКИ ------------------
-HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-}
+HEADERS = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
 TIMEOUT = 10
-DELAY_BETWEEN_SITES = 1      # секунд между разными сайтами
-DELAY_BETWEEN_PAGES = 0.3    # секунд между страницами одного сайта
+DELAY_BETWEEN_SITES = 1
+DELAY_BETWEEN_PAGES = 0.3
 
-# Базовый список страниц для проверки (можно дополнять)
 STATIC_PAGES = [
-    '',  # главная
     '/contacts', '/contact', '/kontakty', '/contact-us', '/feedback',
     '/obratnaya-svyaz', '/svyaz', '/write-us', '/support',
     '/about', '/about-us', '/o-nas', '/company', '/kompaniya',
@@ -32,13 +29,11 @@ STATIC_PAGES = [
     '/contatti', '/contato', '/connexion', '/kontaktai'
 ]
 
-# Регулярные выражения
 EMAIL_REGEX = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
 PHONE_PATTERN = re.compile(r'(\+7|8)?[\s\-]*\(?(\d{3})\)?[\s\-]*(\d{3})[\s\-]*(\d{2})[\s\-]*(\d{2})')
 TG_PATTERNS = [r'(?:https?://)?(?:t\.me|telegram\.me)/([a-zA-Z0-9_]+)']
 WA_PATTERNS = [r'(?:https?://)?(?:wa\.me|api\.whatsapp\.com)/[^\s"\'>]+']
 VK_PATTERNS = [r'(?:https?://)?(?:vk\.com|vkontakte\.ru)/([a-zA-Z0-9_.]+)']
-# ----------------------------------------------
 
 def clean_phone(phone_str):
     digits = re.sub(r'\D', '', phone_str)
@@ -53,8 +48,7 @@ def clean_phone(phone_str):
 def extract_phones_from_text(text):
     phones = set()
     for match in PHONE_PATTERN.finditer(text):
-        raw = match.group(0)
-        cleaned = clean_phone(raw)
+        cleaned = clean_phone(match.group(0))
         if len(cleaned) >= 10:
             phones.add(cleaned)
     return list(phones)
@@ -64,13 +58,12 @@ def extract_phones_from_links(soup):
     for a in soup.find_all('a', href=True):
         href = a['href']
         if href.startswith('tel:'):
-            phone = href[4:].strip()
-            cleaned = clean_phone(phone)
+            cleaned = clean_phone(href[4:].strip())
             if len(cleaned) >= 10:
                 phones.add(cleaned)
     return list(phones)
 
-def extract_social_links(soup, base_url):
+def extract_social_links(soup):
     result = {'telegram': '', 'whatsapp': '', 'vk': ''}
     all_links = set()
     for a in soup.find_all('a', href=True):
@@ -96,7 +89,7 @@ def extract_social_links(soup, base_url):
                     break
     return result
 
-def extract_emails_from_html(html, base_url):
+def extract_emails_from_html(html):
     emails = set()
     soup = BeautifulSoup(html, 'lxml')
     for a in soup.find_all('a', href=True):
@@ -104,67 +97,49 @@ def extract_emails_from_html(html, base_url):
         if href.startswith('mailto:'):
             email = href[7:].split('?')[0]
             emails.add(email)
-    text = soup.get_text()
-    found = re.findall(EMAIL_REGEX, text, re.IGNORECASE)
-    for email in found:
+    for email in re.findall(EMAIL_REGEX, soup.get_text(), re.IGNORECASE):
         emails.add(email)
     return list(emails)
 
 def get_page_follow_redirects(url):
-    """
-    Выполняет GET-запрос с автоматическим следованием редиректам.
-    Возвращает (html, status_code, final_url).
-    html = None при ошибке или не-HTML.
-    status_code – итоговый HTTP-статус после всех редиректов.
-    final_url – URL, на который в итоге попали.
-    """
     try:
         resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT, allow_redirects=True)
-        final_url = resp.url
-        status = resp.status_code
-        if status != 200:
-            return None, status, final_url
-        if 'text/html' not in resp.headers.get('Content-Type', ''):
-            return None, status, final_url
-        return resp.text, status, final_url
+        if resp.status_code != 200 or 'text/html' not in resp.headers.get('Content-Type', ''):
+            return None, resp.status_code, resp.url
+        return resp.text, resp.status_code, resp.url
     except Exception as e:
         print(f"  Ошибка запроса {url}: {e}")
         return None, None, url
 
 def find_contact_links_from_main(html, base_domain):
-    """Извлекает из главной страницы ссылки, вероятно ведущие на контакты."""
     soup = BeautifulSoup(html, 'lxml')
     keywords = ['контакт', 'обратн', 'связ', 'support', 'contact', 'about', 'о нас', 'feedback', 'help', 'ask', 'question', 'адрес', 'реквизит']
-    contact_paths = set()
+    paths = set()
     for a in soup.find_all('a', href=True):
         href = a['href']
         text = a.get_text().lower()
         if any(kw in text for kw in keywords) or any(kw in href.lower() for kw in keywords):
-            full_url = urljoin(base_domain, href)
-            parsed = urlparse(full_url)
-            path = parsed.path
-            if path and path not in ['/', '']:
-                contact_paths.add(path)
-    return list(contact_paths)
+            full = urljoin(base_domain, href)
+            path = urlparse(full).path
+            if path and path not in ('/', ''):
+                paths.add(path)
+    return list(paths)
 
 def is_contact_path(path):
-    """Определяет, похож ли путь на страницу контактов."""
-    keywords = [
-        'contact', 'kontakt', 'обратн', 'связ', 'feedback', 'support',
-        'map', 'adres', 'реквизит', 'requisite', 'about', 'о нас', 'help'
-    ]
-    path_lower = path.lower()
-    return any(kw in path_lower for kw in keywords)
+    keywords = ['contact', 'kontakt', 'обратн', 'связ', 'feedback', 'support', 'map', 'adres', 'реквизит', 'requisite', 'about', 'о нас', 'help']
+    return any(kw in path.lower() for kw in keywords)
 
 def has_any_social(contacts):
-    """Проверяет, есть ли хотя бы одна соцсеть."""
     return bool(contacts['telegram'] or contacts['whatsapp'] or contacts['vk'])
 
-def _format_contacts(contacts):
-    """Преобразует множества в строки."""
-    contacts['emails'] = ', '.join(contacts['emails']) if contacts['emails'] else ''
-    contacts['phones'] = ', '.join(contacts['phones']) if contacts['phones'] else ''
-    return contacts
+def format_contacts(contacts):
+    return {
+        'emails': ', '.join(contacts['emails']) if contacts['emails'] else '',
+        'phones': ', '.join(contacts['phones']) if contacts['phones'] else '',
+        'telegram': contacts['telegram'],
+        'whatsapp': contacts['whatsapp'],
+        'vk': contacts['vk']
+    }
 
 def find_contacts_on_site(base_url):
     contacts = {
@@ -177,120 +152,132 @@ def find_contacts_on_site(base_url):
     
     # ----- Шаг 1: главная -----
     print(f"    Запрашиваем: {base_url}")
-    html_main, status_main, final_main_url = get_page_follow_redirects(base_url)
-    if status_main != 200:
-        print(f"    Итоговый статус {status_main}. Пропускаем.")
-        return contacts
+    html, status, final_url = get_page_follow_redirects(base_url)
+    if status != 200:
+        print(f"    Статус {status}. Пропускаем.")
+        return format_contacts(contacts)
 
-    parsed_final = urlparse(final_main_url)
-    base_domain = f"{parsed_final.scheme}://{parsed_final.netloc}"
+    base_domain = f"{urlparse(final_url).scheme}://{urlparse(final_url).netloc}"
     print(f"    Финальный домен: {base_domain}")
 
-    soup_main = BeautifulSoup(html_main, 'lxml')
-    contacts['emails'].update(extract_emails_from_html(html_main, final_main_url))
-    contacts['phones'].update(extract_phones_from_text(soup_main.get_text()))
-    contacts['phones'].update(extract_phones_from_links(soup_main))
-    soc = extract_social_links(soup_main, final_main_url)
-    for key in ['telegram', 'whatsapp', 'vk']:
-        if not contacts[key] and soc[key]:
-            contacts[key] = soc[key]
+    soup = BeautifulSoup(html, 'lxml')
+    contacts['emails'].update(extract_emails_from_html(html))
+    contacts['phones'].update(extract_phones_from_text(soup.get_text()))
+    contacts['phones'].update(extract_phones_from_links(soup))
+    soc = extract_social_links(soup)
+    for k in ('telegram', 'whatsapp', 'vk'):
+        if not contacts[k] and soc[k]:
+            contacts[k] = soc[k]
 
     # ----- Шаг 2: динамические ссылки на контакты (из главной) -----
-    dynamic_paths = find_contact_links_from_main(html_main, base_domain)
-    # Ограничимся 7 ссылками, чтобы не перегружать
+    dynamic_paths = find_contact_links_from_main(html, base_domain)
+    # Ограничимся 7 ссылками
     dynamic_paths = dynamic_paths[:7]
+    
+    # Запоминаем, какие пути мы уже проверили
+    checked_paths = set()
 
     for path in dynamic_paths:
         url = urljoin(base_domain, path)
         print(f"    Проверяем динамическую страницу: {url}")
-        html, status, _ = get_page_follow_redirects(url)
-        if status != 200 or html is None:
+        html2, status2, _ = get_page_follow_redirects(url)
+        checked_paths.add(path)  # запоминаем проверенный путь
+        if status2 != 200 or not html2:
             continue
-        soup = BeautifulSoup(html, 'lxml')
-        emails_new = extract_emails_from_html(html, url)
-        phones_new = extract_phones_from_text(soup.get_text())
-        phones_new.extend(extract_phones_from_links(soup))
-        soc_new = extract_social_links(soup, url)
-
-        contacts['emails'].update(emails_new)
-        contacts['phones'].update(phones_new)
-        for key in ['telegram', 'whatsapp', 'vk']:
-            if not contacts[key] and soc_new[key]:
-                contacts[key] = soc_new[key]
+        soup2 = BeautifulSoup(html2, 'lxml')
+        contacts['emails'].update(extract_emails_from_html(html2))
+        contacts['phones'].update(extract_phones_from_text(soup2.get_text()))
+        contacts['phones'].update(extract_phones_from_links(soup2))
+        soc2 = extract_social_links(soup2)
+        for k in ('telegram', 'whatsapp', 'vk'):
+            if not contacts[k] and soc2[k]:
+                contacts[k] = soc2[k]
 
         time.sleep(DELAY_BETWEEN_PAGES)
 
-    # ----- Шаг 3: короткий статический список (только если нет соцсетей или нет email/телефона) -----
-    # Если уже есть email, телефон и хотя бы одна соцсеть – дальше не идём
-    if contacts['emails'] and contacts['phones'] and has_any_social(contacts):
-        print("    Уже есть email, телефон и соцсети. Статический список не проверяем.")
-        return _format_contacts(contacts)
-
-    # Иначе проверяем несколько основных страниц
+    # ----- Шаг 3: статический список (только те пути, которые не проверяли) -----
     short_static = [
         '/contacts', '/contact', '/kontakty', '/about', '/o-nas',
         '/contact-us', '/feedback', '/obratnaya-svyaz'
     ]
-    for path in short_static:
+    
+    # Фильтруем: проверяем только те пути, которые ещё не были проверены
+    remaining_paths = [path for path in short_static if path not in checked_paths]
+    
+    if remaining_paths:
+        print(f"    Осталось проверить статические страницы: {remaining_paths}")
+    
+    for path in remaining_paths:
         url = urljoin(base_domain, path)
         print(f"    Проверяем статическую страницу: {url}")
-        html, status, _ = get_page_follow_redirects(url)
-        if status != 200 or html is None:
+        html2, status2, _ = get_page_follow_redirects(url)
+        if status2 != 200 or not html2:
             continue
-        soup = BeautifulSoup(html, 'lxml')
-        emails_new = extract_emails_from_html(html, url)
-        phones_new = extract_phones_from_text(soup.get_text())
-        phones_new.extend(extract_phones_from_links(soup))
-        soc_new = extract_social_links(soup, url)
-
-        contacts['emails'].update(emails_new)
-        contacts['phones'].update(phones_new)
-        for key in ['telegram', 'whatsapp', 'vk']:
-            if not contacts[key] and soc_new[key]:
-                contacts[key] = soc_new[key]
+        soup2 = BeautifulSoup(html2, 'lxml')
+        contacts['emails'].update(extract_emails_from_html(html2))
+        contacts['phones'].update(extract_phones_from_text(soup2.get_text()))
+        contacts['phones'].update(extract_phones_from_links(soup2))
+        soc2 = extract_social_links(soup2)
+        for k in ('telegram', 'whatsapp', 'vk'):
+            if not contacts[k] and soc2[k]:
+                contacts[k] = soc2[k]
 
         time.sleep(DELAY_BETWEEN_PAGES)
 
-        # Если после этой страницы появилась соцсеть, можно остановиться, но не обязательно
-        # if has_any_social(contacts): break
+    return format_contacts(contacts)
 
-    return _format_contacts(contacts)
+def load_existing(output_csv):
+    existing = {}
+    try:
+        with open(output_csv, 'r', encoding='utf-8-sig') as f:
+            for row in csv.DictReader(f):
+                site = row.get('site', '').strip()
+                if site:
+                    existing[site] = row
+    except FileNotFoundError:
+        pass
+    return existing
 
 def process_sites_from_csv(input_csv, output_csv, site_column='site'):
-    rows = []
+    # Создаём директорию для выходного файла, если нужно
+    output_dir = os.path.dirname(output_csv)
+    if output_dir and not os.path.exists(output_dir):
+        os.makedirs(output_dir, exist_ok=True)
+        
+    existing = load_existing(output_csv)
+    new_rows = []
     with open(input_csv, 'r', encoding='utf-8-sig') as f:
-        reader = csv.DictReader(f)
-        fieldnames = reader.fieldnames + ['emails', 'phones', 'telegram', 'whatsapp', 'vk']
-        for row in reader:
+        for row in csv.DictReader(f):
             site = row.get(site_column, '').strip()
-            if not site:
-                for fld in ['emails', 'phones', 'telegram', 'whatsapp', 'vk']:
-                    row[fld] = ''
-                rows.append(row)
+            if not site or site in existing:
+                if site:
+                    print(f"Пропускаем (уже есть): {site}")
                 continue
             print(f"Обработка: {site}")
             contacts = find_contacts_on_site(site)
-            row['emails'] = contacts['emails']
-            row['phones'] = contacts['phones']
-            row['telegram'] = contacts['telegram']
-            row['whatsapp'] = contacts['whatsapp']
-            row['vk'] = contacts['vk']
-            rows.append(row)
+            new_row = {
+                'name': row.get('name', ''),
+                'site': site,
+                'emails': contacts['emails'],
+                'phones': contacts['phones'],
+                'telegram': contacts['telegram'],
+                'whatsapp': contacts['whatsapp'],
+                'vk': contacts['vk']
+            }
+            new_rows.append(new_row)
+            existing[site] = new_row
             time.sleep(DELAY_BETWEEN_SITES)
-
+    # Объединяем старые и новые
+    all_rows = list(existing.values())
+    fieldnames = ['name', 'site', 'emails', 'phones', 'telegram', 'whatsapp', 'vk']
     with open(output_csv, 'w', newline='', encoding='utf-8-sig') as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
-        writer.writerows(rows)
-    print(f"Готово. Результат в {output_csv}")
+        writer.writerows(all_rows)
+    print(f"Готово. Обработано новых сайтов: {len(new_rows)}. Результат в {output_csv}")
 
 if __name__ == '__main__':
-    import sys
     if len(sys.argv) < 3:
         print("Использование: python parser_all.py input.csv output.csv [site_column]")
-        print("Пример: python parser_all.py companies.csv companies_contacts.csv site")
         sys.exit(1)
-    input_csv = sys.argv[1]
-    output_csv = sys.argv[2]
-    site_col = sys.argv[3] if len(sys.argv) > 3 else 'site'
-    process_sites_from_csv(input_csv, output_csv, site_col)
+    process_sites_from_csv(sys.argv[1], sys.argv[2], sys.argv[3] if len(sys.argv) > 3 else 'site')

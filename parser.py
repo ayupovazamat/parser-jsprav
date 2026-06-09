@@ -1,4 +1,3 @@
-#pareser.py
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
@@ -6,19 +5,37 @@ import csv
 import time
 import base64
 import requests
-from urllib.parse import urljoin, urlparse
+import sys
+import os
+from urllib.parse import urljoin
 from bs4 import BeautifulSoup
 
 HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
 }
-DELAY = 30  # секунд между запросами страниц
-OUTPUT_CSV = 'jsprav.ru.csv'
+DELAY = 30
+
+# Обработка параметров командной строки
+if len(sys.argv) < 2:
+    print("Использование: python parser.py <файл_со_ссылками.txt> [выходной_файл.csv]")
+    print("Пример: python parser.py categories.txt output/jsprav.ru.csv")
+    sys.exit(1)
+
+INPUT_FILE = sys.argv[1]
+
+# Если передан второй аргумент, используем его как имя выходного файла
+if len(sys.argv) > 2:
+    OUTPUT_CSV = sys.argv[2]
+else:
+    OUTPUT_CSV = 'jsprav.ru.csv'
+
+# Создаём директорию для выходного файла, если нужно
+output_dir = os.path.dirname(OUTPUT_CSV)
+if output_dir and not os.path.exists(output_dir):
+    os.makedirs(output_dir, exist_ok=True)
 
 def decode_base64(data):
-    """Декодирует base64-строку (иногда с лишними символами)"""
     try:
-        # Добавляем padding если нужно
         missing_padding = len(data) % 4
         if missing_padding:
             data += '=' * (4 - missing_padding)
@@ -27,13 +44,11 @@ def decode_base64(data):
         return None
 
 def get_page(url):
-    """Загружает HTML страницы, возвращает текст или None при ошибке"""
     try:
         resp = requests.get(url, headers=HEADERS, timeout=15, allow_redirects=True)
         if resp.status_code != 200:
             print(f"Статус {resp.status_code} для {url}, пропускаем")
             return None
-        # Проверяем, что вернулся HTML
         if 'text/html' not in resp.headers.get('Content-Type', ''):
             return None
         return resp.text
@@ -41,125 +56,144 @@ def get_page(url):
         print(f"Ошибка загрузки {url}: {e}")
         return None
 
-def parse_page(html, base_url):
-    """
-    Извлекает из HTML все блоки company-info-c.
-    Возвращает список словарей с ключами 'name' и 'site'.
-    """
+def parse_page(html):
     soup = BeautifulSoup(html, 'lxml')
     blocks = soup.select('div.company-info-c')
     if not blocks:
-        print("Блоки div.company-info-c не найдены, возможно страница без компаний или изменилась структура.")
         return []
-
     companies = []
     for block in blocks:
-        # Название компании
         name_span = block.select_one('span.company-info-name-org')
         name = name_span.get_text(strip=True) if name_span else ''
-
-        # Сайт: ищем a.company-info-site-open, извлекаем data-link (base64) или data-text-after
         site = ''
         site_link = block.select_one('a.company-info-site-open')
         if site_link:
-            # Приоритет: атрибут data-link (base64)
             data_link = site_link.get('data-link')
             if data_link:
                 decoded = decode_base64(data_link)
                 if decoded:
                     site = decoded
-            # Если data-link нет или не декодировался, пробуем data-text-after
             if not site:
                 data_text = site_link.get('data-text-after')
                 if data_text and not data_text.startswith('...'):
                     site = data_text.strip()
-            # Если ничего не нашли, пробуем href
             if not site:
                 href = site_link.get('href')
-                if href and href.startswith('/redirect/'):
-                    # Можно попробовать распарсить, но лучше не усложнять
-                    pass
-                elif href and href.startswith('http'):
+                if href and href.startswith('http'):
                     site = href
-        # Сохраняем, если есть хотя бы название
         if name:
             companies.append({'name': name, 'site': site})
-        else:
-            # Если название пустое, но есть сайт – тоже сохраним
-            if site:
-                companies.append({'name': '', 'site': site})
+        elif site:
+            companies.append({'name': '', 'site': site})
     return companies
 
 def get_next_page_url(current_url, current_page):
-    """
-    Формирует URL следующей страницы для jsprav.ru.
-    Если текущий URL не содержит 'page-', добавляет 'page-2/'.
-    Иначе заменяет 'page-N' на 'page-(N+1)'.
-    """
     if '/page-' in current_url:
-        # Заменяем последнее вхождение page-N на page-(N+1)
         import re
         new_url = re.sub(r'/page-\d+/', f'/page-{current_page+1}/', current_url)
         return new_url
     else:
-        # Добавляем page-2 в конец, учитывая слеш
         base = current_url.rstrip('/')
         return f"{base}/page-2/"
 
-def save_to_csv(companies, filename):
-    """Сохраняет список компаний в CSV"""
+def save_to_csv(companies, filename, seen_sites=None):
     if not companies:
-        print("Нет данных для сохранения.")
-        return
-    with open(filename, 'w', newline='', encoding='utf-8-sig') as f:
+        return seen_sites
+    if seen_sites is None:
+        seen_sites = set()
+        try:
+            with open(filename, 'r', encoding='utf-8-sig') as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    if row.get('site'):
+                        seen_sites.add(row['site'])
+        except FileNotFoundError:
+            pass
+    mode = 'a' if os.path.exists(filename) and seen_sites else 'w'
+    with open(filename, mode, newline='', encoding='utf-8-sig') as f:
         writer = csv.DictWriter(f, fieldnames=['name', 'site'])
-        writer.writeheader()
-        writer.writerows(companies)
-    print(f"Сохранено {len(companies)} записей в {filename}")
+        if mode == 'w':
+            writer.writeheader()
+        added = 0
+        for comp in companies:
+            if comp['site'] and comp['site'] in seen_sites:
+                continue
+            writer.writerow(comp)
+            if comp['site']:
+                seen_sites.add(comp['site'])
+                added += 1
+        print(f"Добавлено {added} новых записей в {filename}")
+    return seen_sites
 
-def main(start_url):
+def process_category_url(start_url, seen_sites):
     all_companies = []
     url = start_url
     page_num = 1
-
     while url:
         print(f"Загрузка страницы {page_num}: {url}")
         html = get_page(url)
         if not html:
-            print("Не удалось загрузить страницу. Завершаем.")
             break
-
-        companies = parse_page(html, url)
+        companies = parse_page(html)
         if not companies:
-            print(f"На странице {page_num} нет компаний. Возможно, достигнут конец каталога.")
+            print(f"На странице {page_num} нет компаний. Конец каталога.")
             break
-
         print(f"Найдено компаний на странице: {len(companies)}")
         all_companies.extend(companies)
-
-        # Формируем URL следующей страницы
         next_url = get_next_page_url(url, page_num)
-        # Проверяем, не совпадает ли с текущим
         if next_url == url:
             break
         url = next_url
         page_num += 1
-
-        # Ждём перед следующим запросом
-        print(f"Ожидание {DELAY} секунд перед следующей страницей...")
+        print(f"Ожидание {DELAY} секунд...")
         time.sleep(DELAY)
+    return all_companies
 
-    # Сохраняем результат
-    if all_companies:
-        save_to_csv(all_companies, OUTPUT_CSV)
-    else:
-        print("Ни одной компании не найдено.")
+def main():
+    # Проверяем, что входной файл существует
+    if not os.path.exists(INPUT_FILE):
+        print(f"Ошибка: Файл {INPUT_FILE} не найден!")
+        sys.exit(1)
+    
+    # Загружаем уже обработанные сайты
+    seen_sites = set()
+    try:
+        with open(OUTPUT_CSV, 'r', encoding='utf-8-sig') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                if row.get('site'):
+                    seen_sites.add(row['site'])
+    except FileNotFoundError:
+        pass
+    
+    # Читаем URL категорий из файла
+    with open(INPUT_FILE, 'r') as f:
+        urls = [line.strip() for line in f if line.strip()]
+    
+    if not urls:
+        print("Ошибка: Файл не содержит URL!")
+        sys.exit(1)
+    
+    print(f"Найдено {len(urls)} URL категорий для обработки:")
+    for u in urls:
+        print(f"  - {u}")
+    
+    # Обрабатываем каждую категорию
+    for url in urls:
+        print(f"\n=== Обработка категории: {url} ===")
+        companies = process_category_url(url, seen_sites)
+        if companies:
+            seen_sites = save_to_csv(companies, OUTPUT_CSV, seen_sites)
+        else:
+            print(f"В категории {url} не найдено компаний")
+    
+    # Финальная статистика
+    try:
+        with open(OUTPUT_CSV, 'r', encoding='utf-8-sig') as f:
+            total = sum(1 for _ in f) - 1
+        print(f"\nГотово. Всего собрано компаний: {total}. Результат в {OUTPUT_CSV}")
+    except:
+        print(f"\nГотово. Результат в {OUTPUT_CSV}")
 
 if __name__ == "__main__":
-    import sys
-    if len(sys.argv) != 2:
-        print("Использование: python parser.py <URL начальной страницы>")
-        print("Пример: python parser.py 'https://ufa.jsprav.ru/uslugi-po-iuridicheskomu-soprovozhdeniiu-sdelok-s-nedvizhimostiu/'")
-        sys.exit(1)
-    start_url = sys.argv[1]
-    main(start_url)
+    main()
