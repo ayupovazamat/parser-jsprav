@@ -114,14 +114,25 @@ def extract_emails_from_html(html):
 def get_page_follow_redirects(url):
     try:
         resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT, allow_redirects=True)
-        if resp.status_code != 200 or 'text/html' not in resp.headers.get('Content-Type', ''):
-            return None, resp.status_code, resp.url
-        return resp.text, resp.status_code, resp.url
+        final_url = resp.url
+        status = resp.status_code
+        
+        if status != 200:
+            return None, status, final_url
+        
+        content_type = resp.headers.get('Content-Type', '')
+        if 'text/html' not in content_type:
+            print(f"      Не HTML (Content-Type: {content_type})")
+            return None, status, final_url
+        
+        return resp.text, status, final_url
     except Exception as e:
-        print(f"  Ошибка запроса {url}: {e}")
+        print(f"      Ошибка запроса {url}: {e}")
         return None, None, url
 
 def find_contact_links_from_main(html, base_domain):
+    if not html:
+        return []
     soup = BeautifulSoup(html, 'lxml')
     keywords = ['контакт', 'обратн', 'связ', 'support', 'contact', 'about', 'о нас', 'feedback', 'help', 'ask', 'question', 'адрес', 'реквизит']
     paths = set()
@@ -158,8 +169,10 @@ def find_contacts_on_site(base_url, test_mode=False):
     
     print(f"    Запрашиваем: {base_url}")
     html, status, final_url = get_page_follow_redirects(base_url)
-    if status != 200:
-        print(f"    Статус {status}. Пропускаем.")
+    
+    # Критическая проверка: если нет HTML, пропускаем сайт
+    if status != 200 or not html:
+        print(f"    Статус {status} или HTML пуст. Пропускаем.")
         return format_contacts(contacts)
 
     base_domain = f"{urlparse(final_url).scheme}://{urlparse(final_url).netloc}"
